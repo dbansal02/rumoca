@@ -34,6 +34,10 @@ is not invoked by the Monte Carlo runner. The Python implementation is used for
 the sweep so hundreds of 60 s missions do not pay Rumoca's interpreted solver
 cost on every trial.
 
+The outer-loop attitude gains are exposed as `FirmwareParameters` fields so a
+software/controller change can be separated from an airframe change. Their
+defaults preserve the original controller constants.
+
 ## Run
 
 From this directory, using the examples environment:
@@ -118,3 +122,100 @@ RMSE within `max(0.5 m/s, 25% of the command)`.
 
 This remains a simulation study: wind, mocap dropouts, actuator dynamics, and
 ground contact are outside its scope.
+
+## Autopilot gain sweeps
+
+`autopilot_gain_sweep.py` is a separate entry point; `monte_carlo.py` and its
+existing output remain unchanged. It performs an attributable, one-at-a-time
+firmware-gain sweep at the nominal 4 m/s cruise command. For example:
+
+```bash
+../../.venv/bin/python autopilot_gain_sweep.py \
+  --parameter pitch_attitude_kp --output figures/pitch_attitude_kp.csv
+```
+
+The predefined scale set includes nominal, zero, positive multiples, and
+negative sign/configuration errors. Run `--help` for the named TECS, guidance,
+and attitude parameters. Physical uncertainty draws use the same seed and are
+reused at every scale.
+
+Each CSV row records the root random seed, requested duration, parameter name,
+nominal value, scale, applied value, and all baseline mission metrics.
+`failure_mode` and `time_to_failure_s` report
+hard outcomes directly evidenced by the trace: `ground_impact`, sustained
+stall for at least 1 s, unsafe roll beyond 90 degrees or pitch beyond 60
+degrees for at least 0.5 s, `non_finite_state`, or `early_termination`. The CSV
+also records maximum roll, pitch, and angle of attack plus stall and actuator
+saturation fractions. These thresholds are study assumptions for screening,
+not validated limits for the onsite aircraft. A completed but poorly tracking
+mission remains a degradation in the baseline metrics rather than being called a
+crash. Blank failure time with `failure_mode=none` means no hard failure was
+observed during the requested duration.
+
+The runner writes a PNG beside the CSV unless `--plot` selects another path.
+Every physical-uncertainty trial appears as a faint line across gain scale;
+the median and 10–90% band summarize the Monte Carlo response. A dashed line
+marks the nominal `1x` gain, and the final panel separates mission-tracking
+success from hard failures.
+
+After the one-at-a-time studies identify a sensitive region,
+`autopilot_gain_interaction_sweep.py` runs the focused pitch-attitude Kp x Ki
+grid. Its defaults cover Kp scales `1, 2, 4, 10` and Ki scales
+`1, 2, 4, 6, 8, 10`, with 16 common-random physical trials per gain pair:
+
+```bash
+../../.venv/bin/python autopilot_gain_interaction_sweep.py --workers 4
+```
+
+The interaction runner writes the raw CSV, an annotated response-surface
+dashboard, and a profile figure with median and 10–90% Monte Carlo bands.
+Percentage heatmaps use a fixed 0–100% scale so success, hard failures, and
+saturation remain visually comparable between studies.
+
+`failure_campaign_sweep.py` contains two focused crash-envelope campaigns.
+The SAFE study varies the low-speed protection threshold and forced-dive slope;
+the physical study varies actual thrust and physical mass while leaving the
+controller assumptions nominal:
+
+```bash
+../../.venv/bin/python failure_campaign_sweep.py \
+  --campaign safe_protection --workers 4
+../../.venv/bin/python failure_campaign_sweep.py \
+  --campaign thrust_mass --workers 4
+```
+
+Each campaign writes an annotated dashboard containing hard-failure
+probability, median time to failure, minimum altitude, tracking error, angle of
+attack, and elevator saturation. SAFE `protection_high` is kept exactly 1 m/s
+above the swept `protection_low`, preserving a valid protection ramp while its
+absolute operating range changes. In the physical campaign, Monte Carlo
+airframe draws are applied first and the deterministic mass/thrust scale is
+then applied, so every CSV row records the actual resulting plant values.
+
+`velocity_boundary_sweep.py` tests whether the selected failure boundaries
+depend on commanded cruise speed. It uses commands `2, 3, 4, 5, 6 m/s` and
+reuses identical physical Monte Carlo draws across all velocities and boundary
+conditions:
+
+```bash
+../../.venv/bin/python velocity_boundary_sweep.py --workers 4
+```
+
+The combined CSV identifies the campaign and boundary condition on every row.
+Separate annotated dashboards are written for altitude feedback, SAFE
+protection, and physical thrust-to-mass conditions. The selected boundaries
+are intentionally focused rather than a Cartesian product of every parameter:
+four altitude-gain settings, four SAFE threshold/slope settings, and twelve
+mass/thrust settings.
+
+For the disabled-altitude-feedback boundary, the aggregate heatmap is
+supplemented by a trajectory-level crash visualization:
+
+```bash
+../../.venv/bin/python velocity_crash_visualization.py --workers 4
+```
+
+The left panel shows median altitude and 10–90% Monte Carlo bands at every
+cruise command. Impacted trajectories are held at zero altitude after impact
+so later percentiles are not biased toward survivors. The right panel shows
+the corresponding empirical fraction of aircraft still airborne over time.

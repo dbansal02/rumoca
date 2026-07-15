@@ -122,6 +122,13 @@ class FirmwareParameters:
     distance_integral_limit: float = 7.5
     envelope_drag: float = 0.07
     pitch_limit: float = np.deg2rad(12.0)
+    pitch_attitude_kp: float = 0.4
+    pitch_attitude_ki: float = 0.4
+    pitch_attitude_integral_limit: float = 0.5
+    course_attitude_kp: float = 1.2
+    course_attitude_ki: float = 0.05
+    course_attitude_kd: float = 0.35
+    course_attitude_integral_limit: float = 0.4
 
 
 @dataclass
@@ -163,6 +170,10 @@ class MissionTrace:
     desired_speed: FloatArray
     waypoint: NDArray[np.int64]
     throttle: FloatArray
+    euler: FloatArray
+    angle_of_attack: FloatArray
+    aileron: FloatArray
+    elevator: FloatArray
 
 
 def _rotation_matrix(q: FloatArray) -> FloatArray:
@@ -218,43 +229,53 @@ class SportCubFirmwareModel:
         dt = self.firmware.dt
         count = int(round(duration / dt))
         time = np.arange(count + 1, dtype=float) * dt
-        position = np.empty((count + 1, 3))
-        airspeed = np.empty(count + 1)
-        desired_speed = np.empty(count + 1)
-        waypoint = np.empty(count + 1, dtype=np.int64)
-        throttle = np.empty(count + 1)
+        buffers = {
+            "state": np.empty((count + 1, len(self.state))),
+            "desired_speed": np.empty(count + 1),
+            "waypoint": np.empty(count + 1, dtype=np.int64),
+            "command": np.empty((count + 1, 3)),
+        }
         command = FirmwareCommand(0.0, 0.0, 0.0, 0.0, self.firmware.cruise_speed)
-        self._record(0, position, airspeed, desired_speed, waypoint, throttle, command)
+        self._record(0, buffers, command)
         end_index = count
         for index in range(1, count + 1):
             command = self._firmware_step()
             self.state = self._rk4_step(self.state, command, dt)
             self.state[6:10] /= np.linalg.norm(self.state[6:10])
-            self._record(index, position, airspeed, desired_speed, waypoint, throttle, command)
+            self._record(index, buffers, command)
             if self.state[2] <= 0.0:
                 end_index = index
                 break
         used = slice(0, end_index + 1)
+        state = buffers["state"][used]
+        command = buffers["command"][used]
+        euler = np.array([_euler_from_quaternion(row[6:10]) for row in state])
+        angle_of_attack = (
+            np.arctan2(-state[:, 5], state[:, 3]) + self.airframe.wing_incidence
+        )
         return MissionTrace(
-            time[used], position[used], airspeed[used], desired_speed[used],
-            waypoint[used], throttle[used]
+            time=time[used],
+            position=state[:, :3],
+            airspeed=np.linalg.norm(state[:, 3:6], axis=1),
+            desired_speed=buffers["desired_speed"][used],
+            waypoint=buffers["waypoint"][used],
+            throttle=command[:, 2],
+            euler=euler,
+            angle_of_attack=angle_of_attack,
+            aileron=command[:, 0],
+            elevator=command[:, 1],
         )
 
     def _record(
         self,
         index: int,
-        position: FloatArray,
-        airspeed: FloatArray,
-        desired_speed: FloatArray,
-        waypoint: NDArray[np.int64],
-        throttle: FloatArray,
+        buffers: dict[str, FloatArray],
         command: FirmwareCommand,
     ) -> None:
-        position[index] = self.state[:3]
-        airspeed[index] = np.linalg.norm(self.state[3:6])
-        desired_speed[index] = command.desired_speed
-        waypoint[index] = self.controller.current_waypoint
-        throttle[index] = command.throttle
+        buffers["state"][index] = self.state
+        buffers["desired_speed"][index] = command.desired_speed
+        buffers["waypoint"][index] = self.controller.current_waypoint
+        buffers["command"][index] = [command.aileron, command.elevator, command.throttle]
 
     def _firmware_step(self) -> FirmwareCommand:
         state = self.controller
@@ -379,12 +400,15 @@ class SportCubFirmwareModel:
         yaw_error = _wrap(desired_heading - state.euler[2])
         error = np.array([pitch_error, yaw_error])
         derivative = np.array([pitch_rate_error, (yaw_error - state.pid_error[1]) / params.dt])
-        limits = np.array([0.5, 0.4])
+        limits = np.array([
+            params.pitch_attitude_integral_limit,
+            params.course_attitude_integral_limit,
+        ])
         state.pid_integral = np.clip(state.pid_integral + error * params.dt, -limits, limits)
         command = np.clip(
-            np.array([0.4, 1.2]) * error
-            + np.array([0.4, 0.05]) * state.pid_integral
-            + np.array([0.0, 0.35]) * derivative
+            np.array([params.pitch_attitude_kp, params.course_attitude_kp]) * error
+            + np.array([params.pitch_attitude_ki, params.course_attitude_ki]) * state.pid_integral
+            + np.array([0.0, params.course_attitude_kd]) * derivative
             + np.array([elevator_feedforward, 0.0]),
             -1.0,
             1.0,
